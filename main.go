@@ -1,5 +1,5 @@
 package main
 
 func main() {
-	println("ester marco edo")
+	println("ester marco")
 }
