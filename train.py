@@ -15,7 +15,7 @@ from torchvision.datasets import ImageFolder
 from model import MiniCifakeCNN, PREPROCESS, IMG_SIZE
 
 EPOCHS = 15
-DATA = "cifake"
+DATA = "/home/sarac/.cache/kagglehub/datasets/birdy654/cifake-real-and-ai-generated-synthetic-images/versions/3"
 
 TRAIN_TF = transforms.Compose([
     transforms.RandomHorizontalFlip(),   # augmentation leggera, come nel repo originale
