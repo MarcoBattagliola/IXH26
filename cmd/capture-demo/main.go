@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -155,13 +156,39 @@ type artifact struct {
 	bits, manifest, t0, t1, proof []byte
 	cert3                         capture.ManifestCASignature
 	statement                     capture.CaptureStatement
+	window                        capture.CaptureWindow // filled by the PCC
+	m                             captureMetrics
+}
+
+// captureMetrics are the device-side timings of one capture.
+type captureMetrics struct {
+	t0Fetch, hashToCurve, sensorSign, enclaveSign, prove, cryptoVerify, commit, t1Publish, total time.Duration
+}
+
+// pccMetrics are the verifier-side timings.
+type pccMetrics struct {
+	registryFetch, fullVerify time.Duration
+}
+
+// timed runs f and returns its duration.
+func timed(f func()) time.Duration {
+	start := time.Now()
+	f()
+	return time.Since(start)
 }
 
 // captureOnce runs one full device-side capture: T0, both layer signatures,
 // NIZK, then T1 publication.
 func captureOnce(ctx context.Context, x xrplTool, src *capture.XRPLClient, deviceSeed string,
 	auth *authorities, maxAge time.Duration) artifact {
-	t0, ledger, err := capture.NewCaptureTimestamp(ctx, src, maxAge)
+	var mt captureMetrics
+	start := time.Now()
+	var (
+		t0     []byte
+		ledger capture.LedgerAnchor
+		err    error
+	)
+	mt.t0Fetch = timed(func() { t0, ledger, err = capture.NewCaptureTimestamp(ctx, src, maxAge) })
 	if err != nil {
 		log.Fatalf("cannot anchor capture to XRPL: %v", err)
 	}
@@ -170,7 +197,8 @@ func captureOnce(ctx context.Context, x xrplTool, src *capture.XRPLClient, devic
 	bits, err := capture.RandomBitString(256)
 	must(err)
 	manifest := []byte("factory manifest: two JR-certified hardware signing keys")
-	m, err := capture.HashCaptureToG1(bits, 256, manifest, t0)
+	var m *blst.P1
+	mt.hashToCurve = timed(func() { m, err = capture.HashCaptureToG1(bits, 256, manifest, t0) })
 	must(err)
 
 	sensor, err := capture.NewLayerSecret(capture.LayerSensor)
@@ -198,10 +226,11 @@ func captureOnce(ctx context.Context, x xrplTool, src *capture.XRPLClient, devic
 	must(enclave.CheckInstalledKeyIntegrity())
 
 	// Trusted layer operations. The responses Z must stay out of the DNG.
-	sensorAtt, err := sensor.SensorAttest(m.ToAffine())
+	var sensorAtt, enclaveAtt capture.SchnorrAttestation
+	mt.sensorSign = timed(func() { sensorAtt, err = sensor.SensorAttest(m.ToAffine()) })
 	must(err)
 	defer sensorAtt.Clear()
-	enclaveAtt, err := enclave.EnclaveAttest(m.ToAffine(), &sensorAtt.R)
+	mt.enclaveSign = timed(func() { enclaveAtt, err = enclave.EnclaveAttest(m.ToAffine(), &sensorAtt.R) })
 	must(err)
 	defer enclaveAtt.Clear()
 
@@ -212,35 +241,160 @@ func captureOnce(ctx context.Context, x xrplTool, src *capture.XRPLClient, devic
 	// DEMO TRUST BOUNDARY: the witness below is assembled in one Go process.
 	// Production requires trusted assembly or a separately designed distributed
 	// GS prover; do not send the raw responses to an untrusted device OS.
-	proof, err := capture.CaptureProve(auth.crs, &statement, &witness)
+	var serialized []byte
+	mt.prove = timed(func() {
+		var proof capture.CaptureProof
+		if proof, err = capture.CaptureProve(auth.crs, &statement, &witness); err == nil {
+			serialized, err = proof.MarshalBinary()
+		}
+	})
 	must(err)
-	serialized, err := proof.MarshalBinary()
+	// Pure cryptographic verification (no XRPL): GS + opening PoK.
+	var ok bool
+	mt.cryptoVerify = timed(func() { ok, err = capture.CaptureVerifySerialized(auth.crs, &statement, serialized) })
 	must(err)
+	if !ok {
+		log.Fatal("Groth-Sahai verifier rejected a fresh proof")
+	}
 
-	commitment, err := capture.CaptureCommitment(&statement, serialized)
+	var commitment [32]byte
+	mt.commit = timed(func() { commitment, err = capture.CaptureCommitment(&statement, serialized) })
 	must(err)
-	t1 := x.publishT1(ctx, deviceSeed, commitment)
+	var t1 []byte
+	mt.t1Publish = timed(func() { t1 = x.publishT1(ctx, deviceSeed, commitment) })
+	mt.total = time.Since(start)
 	t1Anchor, err := capture.DecodeT1Anchor(t1)
 	must(err)
 	fmt.Printf("  T1 = tx %X in ledger #%d (memo D = %X)\n", t1Anchor.TxHash, t1Anchor.LedgerIndex, commitment)
-	return artifact{bits: bits, manifest: manifest, t0: t0, t1: t1, proof: serialized, cert3: cert3, statement: statement}
+	return artifact{bits: bits, manifest: manifest, t0: t0, t1: t1, proof: serialized, cert3: cert3, statement: statement, m: mt}
 }
 
 // pccVerify is the relying party: it reads the registry of the pinned
 // governance account and verifies the artifact against it.
 func pccVerify(ctx context.Context, src *capture.XRPLClient, registryAccount string, auth *authorities,
-	a artifact, maxWindow time.Duration) (capture.CaptureWindow, error) {
-	reg, err := capture.FetchCARegistry(ctx, src, registryAccount, src.NetworkID())
+	a artifact, maxWindow time.Duration) (capture.CaptureWindow, pccMetrics, error) {
+	var pm pccMetrics
+	var (
+		reg *capture.CARegistry
+		err error
+	)
+	pm.registryFetch = timed(func() { reg, err = capture.FetchCARegistry(ctx, src, registryAccount, src.NetworkID()) })
 	if err != nil {
-		return capture.CaptureWindow{}, err
+		return capture.CaptureWindow{}, pm, err
 	}
 	st := a.statement
-	ok, w, err := capture.CaptureVerifyWithRegistry(ctx, src, reg, auth.crs, a.bits, 256, a.manifest,
-		a.t0, a.t1, maxWindow, &a.cert3, &auth.vk3, &st, a.proof)
+	var (
+		ok bool
+		w  capture.CaptureWindow
+	)
+	pm.fullVerify = timed(func() {
+		ok, w, err = capture.CaptureVerifyWithRegistry(ctx, src, reg, auth.crs, a.bits, 256, a.manifest,
+			a.t0, a.t1, maxWindow, &a.cert3, &auth.vk3, &st, a.proof)
+	})
 	if err == nil && !ok {
 		err = fmt.Errorf("verification returned false")
 	}
-	return w, err
+	return w, pm, err
+}
+
+func ms(d time.Duration) string  { return fmt.Sprintf("%.2f ms", float64(d.Microseconds())/1000) }
+func sec(d time.Duration) string { return fmt.Sprintf("%.2f s", d.Seconds()) }
+
+// printReport prints the final summary of sizes and timings for capture A.
+func printReport(a artifact, pm pccMetrics, setup map[string]time.Duration, total time.Duration) {
+	proofLen := len(a.proof)
+	perPhoto := proofLen + capture.SchnorrPublicNoncesSize + capture.ManifestCASignatureSize +
+		capture.LedgerAnchorEncodedSize + capture.T1AnchorEncodedSize
+	row := func(k, v, note string) { fmt.Printf("  %-36s %12s   %s\n", k, v, note) }
+	line := strings.Repeat("=", 72)
+
+	fmt.Println()
+	fmt.Println(line)
+	fmt.Println("  SIGNATURE REPORT (capture A)")
+	fmt.Println(line)
+
+	fmt.Println("Space per photo (bytes, added to the DNG):")
+	row("Groth-Sahai core", fmt.Sprint(capture.CaptureGSCoreBytes), "hidden JR certs + Schnorr relations")
+	row("Opening proof of knowledge", fmt.Sprint(capture.CaptureOpeningPoKBytes), "Fiat-Shamir")
+	row("NIZK total", fmt.Sprint(proofLen), "")
+	row("Sensor + enclave nonces R_s, R_e", fmt.Sprint(capture.SchnorrPublicNoncesSize), "")
+	row("CA3 manifest signature", fmt.Sprint(capture.ManifestCASignatureSize), "Schnorr")
+	row("XRPL anchor T0", fmt.Sprint(capture.LedgerAnchorEncodedSize), "not before")
+	row("XRPL anchor T1", fmt.Sprint(capture.T1AnchorEncodedSize), "not after")
+	row("TOTAL per photo", fmt.Sprint(perPhoto), fmt.Sprintf("%.2f KiB, excl. image and manifest", float64(perPhoto)/1024))
+
+	fmt.Println("Shared parameters (bytes, once per ecosystem):")
+	row("Global GS CRS", fmt.Sprint(capture.CaptureCRSCompressedSize), "")
+	row("CA1 / CA2 Jutla-Roy VK", fmt.Sprint(capture.VkCompressedSize), "each")
+	row("CA3 Schnorr VK", fmt.Sprint(capture.ManifestCAPublicKeySize), "")
+	row("JR device certificate", fmt.Sprint(capture.SignatureCompressedSize), "inside the NIZK, not in the DNG")
+	row("CA registry event", fmt.Sprint(capture.RegistryEventEncodedSize), "XRPL memo, per key event")
+
+	m := a.m
+	fmt.Println("Device timings:")
+	row("T0: fetch validated ledger", ms(m.t0Fetch), "network")
+	row("Hash-to-curve M", ms(m.hashToCurve), "")
+	row("Sensor Schnorr signature", ms(m.sensorSign), "incl. key integrity check")
+	row("Enclave Schnorr signature", ms(m.enclaveSign), "incl. key integrity check")
+	row("NIZK prove", ms(m.prove), "GS + opening PoK")
+	row("NIZK verify (crypto only)", ms(m.cryptoVerify), "local self-check")
+	row("Commitment D", ms(m.commit), "")
+	row("T1: publish + validation", sec(m.t1Publish), "network, XRPL consensus")
+	row("TOTAL capture", sec(m.total), "")
+	row("Signing (excl. network)", ms(m.hashToCurve+m.sensorSign+m.enclaveSign+m.prove+m.commit), "")
+
+	fmt.Println("Verifier (PCC) timings:")
+	row("Registry fetch (account_tx)", ms(pm.registryFetch), "network")
+	row("Full verification", ms(pm.fullVerify), "XRPL T0/T1 lookups + crypto + registry rule")
+
+	fmt.Println("XRPL:")
+	row("Time window [T0, T1]", a.window.Width().String(), fmt.Sprintf("ledgers #%d..#%d", a.window.T0.LedgerIndex, a.window.T1Ledger.LedgerIndex))
+	for _, k := range []string{"governance setup", "registry ACTIVATE", "registry REVOKE"} {
+		if d, ok := setup[k]; ok {
+			row(k, sec(d), "")
+		}
+	}
+	row("Whole demo", sec(total), "")
+
+	fp, err := capture.GlobalCaptureCRSFingerprint()
+	must(err)
+	fmt.Printf("CRS %s, SHA-256 %x\n", capture.GlobalCaptureCRSVersion, fp)
+	fmt.Println("Neither private signing scalar nor Schnorr response is serialized into the DNG")
+	fmt.Println(line)
+}
+
+// resolveScript makes a relative script path work from any directory inside
+// the project: it is tried as given, then relative to the module root (the
+// nearest parent directory containing go.mod).
+func resolveScript(p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return p
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			if c := filepath.Join(dir, p); fileExists(c) {
+				return c
+			}
+			return p
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return p
+		}
+		dir = parent
+	}
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func main() {
@@ -254,9 +408,17 @@ func main() {
 	useMultisign := flag.Bool("multisign", true, "protect the registry account with 2-of-3 XRPL multisign (master key disabled)")
 	flag.Parse()
 
+	demoStart := time.Now()
+	setup := map[string]time.Duration{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	x := xrplTool{script: *script, wss: *wssURL, network: uint32(*networkID)}
+	x := xrplTool{script: resolveScript(*script), wss: *wssURL, network: uint32(*networkID)}
+	if !fileExists(x.script) {
+		log.Fatalf("XRPL submitter %q not found: run the demo from the project root (go run ./cmd/capture-demo) or pass -t1-script", *script)
+	}
+	if !fileExists(filepath.Join(filepath.Dir(x.script), "node_modules", "xrpl")) {
+		log.Fatalf("xrpl.js not installed: run `npm ci` in %s first", filepath.Dir(x.script))
+	}
 	src := capture.NewXRPLClient(*rpcURL, uint32(*networkID))
 
 	// Accounts: governance (CA registry) and device (T1).
@@ -274,7 +436,7 @@ func main() {
 				log.Fatal("mainnet: set up governance once with `node tools/t1-submit/submit_t1.mjs --setup-governance`, " +
 					"store the signer seeds safely, then pass XRPL_REGISTRY_SIGNER_SEEDS (or use -multisign=false)")
 			}
-			_, signers = x.setupGovernance(ctx, regSeed)
+			setup["governance setup"] = timed(func() { _, signers = x.setupGovernance(ctx, regSeed) })
 			fmt.Printf("Registry %s: 2-of-3 multisign enabled, master key disabled\n", regAccount)
 		}
 		if len(signers) < 2 {
@@ -303,11 +465,14 @@ func main() {
 	must(err)
 	idCRS, err := capture.KeyIDCRS(auth.crs)
 	must(err)
-	act := x.publishRegistry(ctx, gov,
-		capture.RegistryEvent{Op: capture.OpActivate, Role: capture.RoleCA1, KeyID: id1},
-		capture.RegistryEvent{Op: capture.OpActivate, Role: capture.RoleCA2, KeyID: id2},
-		capture.RegistryEvent{Op: capture.OpActivate, Role: capture.RoleCA3, KeyID: id3},
-		capture.RegistryEvent{Op: capture.OpActivate, Role: capture.RoleCRS, KeyID: idCRS})
+	var act txResult
+	setup["registry ACTIVATE"] = timed(func() {
+		act = x.publishRegistry(ctx, gov,
+			capture.RegistryEvent{Op: capture.OpActivate, Role: capture.RoleCA1, KeyID: id1},
+			capture.RegistryEvent{Op: capture.OpActivate, Role: capture.RoleCA2, KeyID: id2},
+			capture.RegistryEvent{Op: capture.OpActivate, Role: capture.RoleCA3, KeyID: id3},
+			capture.RegistryEvent{Op: capture.OpActivate, Role: capture.RoleCRS, KeyID: idCRS})
+	})
 	fmt.Printf("Registry %s: ACTIVATE CA1, CA2, CA3, CRS in ledger #%d\n", regAccount, act.LedgerIndex)
 
 	if *useMultisign {
@@ -333,8 +498,9 @@ func main() {
 
 	fmt.Println("Capture A:")
 	photoA := captureOnce(ctx, x, src, deviceSeed, &auth, *maxAge)
-	w, err := pccVerify(ctx, src, regAccount, &auth, photoA, *maxWindow)
+	w, pmA, err := pccVerify(ctx, src, regAccount, &auth, photoA, *maxWindow)
 	must(err)
+	photoA.window = w
 	fmt.Printf("PCC: capture A VALID, hardware signed within %s\n", w)
 
 	if *revocationDemo {
@@ -342,42 +508,24 @@ func main() {
 		latest, err := src.LatestValidatedLedger(ctx)
 		must(err)
 		since := latest.LedgerIndex + 1
-		rev := x.publishRegistry(ctx, gov, capture.RegistryEvent{
-			Op: capture.OpRevoke, Role: capture.RoleCA3, KeyID: id3, CompromisedSince: since})
+		var rev txResult
+		setup["registry REVOKE"] = timed(func() {
+			rev = x.publishRegistry(ctx, gov, capture.RegistryEvent{
+				Op: capture.OpRevoke, Role: capture.RoleCA3, KeyID: id3, CompromisedSince: since})
+		})
 		fmt.Printf("Registry: REVOKE CA3 (compromised since ledger #%d) in ledger #%d\n", since, rev.LedgerIndex)
 
 		fmt.Println("Capture B (signed with the compromised CA3 after the revocation):")
 		photoB := captureOnce(ctx, x, src, deviceSeed, &auth, *maxAge)
-		if _, err := pccVerify(ctx, src, regAccount, &auth, photoB, *maxWindow); err != nil {
+		if _, _, err := pccVerify(ctx, src, regAccount, &auth, photoB, *maxWindow); err != nil {
 			fmt.Printf("PCC: capture B REJECTED as expected: %v\n", err)
 		} else {
 			log.Fatal("capture B accepted after CA3 revocation")
 		}
-		w, err = pccVerify(ctx, src, regAccount, &auth, photoA, *maxWindow)
+		_, _, err = pccVerify(ctx, src, regAccount, &auth, photoA, *maxWindow)
 		must(err)
 		fmt.Printf("PCC: capture A still VALID after the revocation (published before ledger #%d)\n", since)
 	}
 
-	fingerprint, err := capture.GlobalCaptureCRSFingerprint()
-	must(err)
-	serialized := photoA.proof
-	fmt.Println("Verified random-bitstring capture artifact (JR + two hidden Schnorr signatures)")
-	fmt.Println("Sensor and enclave private/public consistency + JR certificates: OK")
-	fmt.Printf("Pinned global SXDH soundness CRS version: %s\n", capture.GlobalCaptureCRSVersion)
-	fmt.Printf("Global CRS SHA-256 fingerprint: %x\n", fingerprint)
-	fmt.Printf("Jutla-Roy certificate size: %d bytes per device key (inside NIZK)\n", capture.SignatureCompressedSize)
-	fmt.Printf("Jutla-Roy CA1/CA2 VK size: %d bytes each (shared)\n", capture.VkCompressedSize)
-	fmt.Printf("CA3 public Schnorr signature: %d bytes\n", capture.ManifestCASignatureSize)
-	fmt.Printf("CA3 Schnorr verification key: %d bytes (shared)\n", capture.ManifestCAPublicKeySize)
-	fmt.Printf("Public sensor+enclave Schnorr nonces: %d bytes\n", capture.SchnorrPublicNoncesSize)
-	fmt.Printf("Groth-Sahai core size: %d bytes\n", capture.CaptureGSCoreBytes)
-	fmt.Printf("Schnorr opening knowledge proof size: %d bytes\n", capture.CaptureOpeningPoKBytes)
-	fmt.Printf("Complete NIZK size: %d bytes\n", len(serialized))
-	fmt.Printf("Proof + public nonces total: %d bytes\n", len(serialized)+capture.SchnorrPublicNoncesSize)
-	fmt.Printf("Proof + public nonces + CA3 manifest signature: %d bytes\n", len(serialized)+capture.SchnorrPublicNoncesSize+capture.ManifestCASignatureSize)
-	fmt.Printf("Public GS CRS size: %d bytes (shared)\n", capture.CaptureCRSCompressedSize)
-	fmt.Printf("XRPL ledger anchor T0: %d bytes (public, in DNG)\n", capture.LedgerAnchorEncodedSize)
-	fmt.Printf("XRPL transaction anchor T1: %d bytes (public, in DNG)\n", capture.T1AnchorEncodedSize)
-	fmt.Printf("CA registry event: %d bytes per memo (on XRPL, not per photo)\n", capture.RegistryEventEncodedSize)
-	fmt.Println("Neither private signing scalar nor Schnorr response is serialized into the DNG")
+	printReport(photoA, pmA, setup, time.Since(demoStart))
 }
