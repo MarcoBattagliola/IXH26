@@ -7,8 +7,9 @@ import (
 	"log"
 	"time"
 
-	blst "github.com/supranational/blst/bindings/go"
 	"hackaton2026/crypto/capture"
+
+	blst "github.com/supranational/blst/bindings/go"
 )
 
 func must(err error) {
@@ -35,6 +36,7 @@ func main() {
 	fmt.Printf("T0 = XRPL network %d ledger #%d hash %X closed %s\n",
 		ledger.NetworkID, ledger.LedgerIndex, ledger.LedgerHash, ledger.Time().Format(time.RFC3339))
 
+	//random bit string represent a photo
 	bits, err := capture.RandomBitString(256)
 	must(err)
 	manifest := []byte("factory manifest: two JR-certified hardware signing keys")
