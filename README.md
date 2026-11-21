@@ -19,3 +19,7 @@ bash ./run_all.sh
 ```
 
 The script installs the Go and npm dependencies, uses the included global CRS, runs the tests and checks, executes the XRPL Testnet demo, and finishes with benchmarks. A successful run ends with `ALL CHECKS PASSED.`
+
+## Documentation
+
+The full specification of the project (protocol, cryptographic construction, security model and design choices) is in [`IXH26_spec.pdf`](IXH26_spec.pdf).
