@@ -19,15 +19,23 @@ type fakeLedgerSource struct {
 	network uint32
 	latest  LedgerAnchor
 	byHash  map[[32]byte]LedgerAnchor
+	byIndex map[uint32]LedgerAnchor
+	txs     map[[32]byte]XRPLTransaction
 }
 
 func newFakeLedgerSource(network uint32, ledgers ...LedgerAnchor) *fakeLedgerSource {
-	s := &fakeLedgerSource{network: network, byHash: map[[32]byte]LedgerAnchor{}}
+	s := &fakeLedgerSource{network: network, byHash: map[[32]byte]LedgerAnchor{},
+		byIndex: map[uint32]LedgerAnchor{}, txs: map[[32]byte]XRPLTransaction{}}
 	for _, l := range ledgers {
-		s.byHash[l.LedgerHash] = l
-		s.latest = l
+		s.addLedger(l)
 	}
 	return s
+}
+
+func (s *fakeLedgerSource) addLedger(l LedgerAnchor) {
+	s.byHash[l.LedgerHash] = l
+	s.byIndex[l.LedgerIndex] = l
+	s.latest = l
 }
 
 func (s *fakeLedgerSource) NetworkID() uint32 { return s.network }
@@ -40,6 +48,20 @@ func (s *fakeLedgerSource) LedgerByHash(_ context.Context, h [32]byte) (LedgerAn
 		return LedgerAnchor{}, errors.New("lgrNotFound")
 	}
 	return l, nil
+}
+func (s *fakeLedgerSource) LedgerByIndex(_ context.Context, i uint32) (LedgerAnchor, error) {
+	l, ok := s.byIndex[i]
+	if !ok {
+		return LedgerAnchor{}, errors.New("lgrNotFound")
+	}
+	return l, nil
+}
+func (s *fakeLedgerSource) TransactionByHash(_ context.Context, h [32]byte) (XRPLTransaction, error) {
+	tx, ok := s.txs[h]
+	if !ok {
+		return XRPLTransaction{}, errors.New("txnNotFound")
+	}
+	return tx, nil
 }
 
 func testLedgerAnchor() LedgerAnchor {
@@ -175,49 +197,4 @@ func TestXRPLClientParsesLedgerResponse(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestCaptureVerifyAnchoredTrusted(t *testing.T) {
-	f := makeCaptureFixture(t)
-	p := mustProve(t, f)
-	data, err := p.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	verify := func(src LedgerSource, ts []byte) (bool, error) {
-		ok, _, err := CaptureVerifyAnchoredTrusted(context.Background(), src, f.Anchor, f.CRS,
-			f.Bits, f.BitCount, f.Manifest, ts, &f.CA3Certificate, &f.CA3VK, &f.Statement, data)
-		return ok, err
-	}
-	ok, ledger, err := CaptureVerifyAnchoredTrusted(context.Background(), f.LedgerSource, f.Anchor, f.CRS,
-		f.Bits, f.BitCount, f.Manifest, f.Timestamp, &f.CA3Certificate, &f.CA3VK, &f.Statement, data)
-	if err != nil || !ok || ledger != f.Ledger {
-		t.Fatalf("valid anchored capture rejected: %v %v", ok, err)
-	}
-	t.Run("ledger_unknown_to_pcc_node", func(t *testing.T) {
-		if ok, _ := verify(newFakeLedgerSource(XRPLNetworkTestnet), f.Timestamp); ok {
-			t.Fatal("unknown ledger accepted")
-		}
-	})
-	t.Run("pcc_pins_other_network", func(t *testing.T) {
-		if ok, _ := verify(newFakeLedgerSource(XRPLNetworkMainnet, f.Ledger), f.Timestamp); ok {
-			t.Fatal("cross-network anchor accepted")
-		}
-	})
-	t.Run("backdated_close_time", func(t *testing.T) {
-		// A real older ledger exists on chain, but M was computed with f.Ledger.
-		older := f.Ledger
-		older.LedgerIndex -= 100
-		older.CloseTime -= 400
-		older.LedgerHash[31] ^= 0xFF
-		src := newFakeLedgerSource(XRPLNetworkTestnet, older, f.Ledger)
-		if ok, _ := verify(src, older.Encode()); ok {
-			t.Fatal("swapped ledger anchor accepted")
-		}
-	})
-	t.Run("free_form_timestamp", func(t *testing.T) {
-		if ok, _ := verify(f.LedgerSource, []byte("2026-11-21T00:00:00Z")); ok {
-			t.Fatal("non-ledger timestamp accepted")
-		}
-	})
 }

@@ -1,0 +1,19 @@
+{
+  "name": "hackaton2026-t1-submit",
+  "private": true,
+  "type": "module",
+  "description": "Publishes the T1 capture commitment in an XRPL transaction memo",
+  "bin": "submit_t1.mjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "xrpl": "4.7.0"
+  },
+  "overrides": {
+    "@xrplf/isomorphic": "1.0.1",
+    "@scure/base": "1.2.6",
+    "@noble/hashes": "1.8.0",
+    "@noble/curves": "1.9.7"
+  }
+}

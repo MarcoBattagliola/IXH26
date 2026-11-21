@@ -19,8 +19,9 @@ import (
 // the most recent *validated* XRPL ledger at capture time. The ledger hash
 // commits to the ledger header, which contains close_time, so a verifier that
 // re-fetches the ledger by hash from a node it trusts authenticates both the
-// ledger and its time. This yields a "not before" bound only: it does NOT
-// prove that the capture happened shortly after that ledger.
+// ledger and its time. T0 alone yields a "not before" bound only, and an old
+// ledger is still a valid ledger: the matching "not after" bound is T1
+// (XRPLWindow.go), and the PCC must verify both.
 
 // Public JSON-RPC endpoints. NetworkID must match the endpoint.
 const (
@@ -93,9 +94,11 @@ type LedgerSource interface {
 	NetworkID() uint32
 	LatestValidatedLedger(ctx context.Context) (LedgerAnchor, error)
 	LedgerByHash(ctx context.Context, hash [32]byte) (LedgerAnchor, error)
+	LedgerByIndex(ctx context.Context, index uint32) (LedgerAnchor, error)
+	TransactionByHash(ctx context.Context, hash [32]byte) (XRPLTransaction, error)
 }
 
-// XRPLClient is a minimal JSON-RPC client for the rippled `ledger` method.
+// XRPLClient is a minimal JSON-RPC client for the rippled `ledger` and `tx` methods.
 type XRPLClient struct {
 	RPCURL  string
 	Network uint32
@@ -120,6 +123,11 @@ func (c *XRPLClient) LedgerByHash(ctx context.Context, hash [32]byte) (LedgerAnc
 	return c.ledger(ctx, map[string]any{"ledger_hash": hex.EncodeToString(hash[:])})
 }
 
+// LedgerByIndex fetches a validated ledger header by sequence number.
+func (c *XRPLClient) LedgerByIndex(ctx context.Context, index uint32) (LedgerAnchor, error) {
+	return c.ledger(ctx, map[string]any{"ledger_index": index})
+}
+
 type xrplLedgerResponse struct {
 	Result struct {
 		Status      string `json:"status"`
@@ -135,16 +143,15 @@ type xrplLedgerResponse struct {
 	} `json:"result"`
 }
 
-func (c *XRPLClient) ledger(ctx context.Context, params map[string]any) (LedgerAnchor, error) {
-	params["transactions"] = false
-	params["expand"] = false
-	body, err := json.Marshal(map[string]any{"method": "ledger", "params": []any{params}})
+// rpc performs one JSON-RPC call and decodes the (size-limited) reply into out.
+func (c *XRPLClient) rpc(ctx context.Context, method string, params map[string]any, out any) error {
+	body, err := json.Marshal(map[string]any{"method": method, "params": []any{params}})
 	if err != nil {
-		return LedgerAnchor{}, err
+		return err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.RPCURL, bytes.NewReader(body))
 	if err != nil {
-		return LedgerAnchor{}, err
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	hc := c.HTTP
@@ -153,15 +160,24 @@ func (c *XRPLClient) ledger(ctx context.Context, params map[string]any) (LedgerA
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return LedgerAnchor{}, fmt.Errorf("xrpl rpc: %w", err)
+		return fmt.Errorf("xrpl rpc: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return LedgerAnchor{}, fmt.Errorf("xrpl rpc: http %d", resp.StatusCode)
+		return fmt.Errorf("xrpl rpc: http %d", resp.StatusCode)
 	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out); err != nil {
+		return fmt.Errorf("xrpl rpc: decode: %w", err)
+	}
+	return nil
+}
+
+func (c *XRPLClient) ledger(ctx context.Context, params map[string]any) (LedgerAnchor, error) {
+	params["transactions"] = false
+	params["expand"] = false
 	var r xrplLedgerResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&r); err != nil {
-		return LedgerAnchor{}, fmt.Errorf("xrpl rpc: decode: %w", err)
+	if err := c.rpc(ctx, "ledger", params, &r); err != nil {
+		return LedgerAnchor{}, err
 	}
 	return anchorFromXRPLResponse(&r, c.Network)
 }
@@ -240,30 +256,4 @@ func VerifyLedgerAnchor(ctx context.Context, src LedgerSource, timestamp []byte)
 		return LedgerAnchor{}, errors.New("ledger anchor does not match XRPL ledger")
 	}
 	return claimed, nil
-}
-
-// CaptureVerifyAnchoredTrusted is CaptureVerifyBoundTrusted plus XRPL
-// verification of T0. src must be chosen by the relying party (pinned node and
-// network), never taken from the artifact. On success it returns the verified
-// anchor, whose Time() is a lower bound on the capture time.
-func CaptureVerifyAnchoredTrusted(
-	ctx context.Context,
-	src LedgerSource,
-	anchor CaptureTrustAnchor,
-	crs CaptureCRS,
-	raw []byte, bitCount int,
-	manifest, timestamp []byte,
-	ca3sig *ManifestCASignature, ca3VK *ManifestCAPublicKey,
-	st *CaptureStatement,
-	proofBytes []byte,
-) (bool, LedgerAnchor, error) {
-	ledger, err := VerifyLedgerAnchor(ctx, src, timestamp)
-	if err != nil {
-		return false, LedgerAnchor{}, err
-	}
-	ok, err := CaptureVerifyBoundTrusted(anchor, crs, raw, bitCount, manifest, timestamp, ca3sig, ca3VK, st, proofBytes)
-	if err != nil || !ok {
-		return false, LedgerAnchor{}, err
-	}
-	return true, ledger, nil
 }

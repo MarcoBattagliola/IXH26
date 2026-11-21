@@ -3,7 +3,8 @@
 # sensor/enclave hidden Schnorr, Groth–Sahai, globally pinned SXDH CRS.
 # Windows Git Bash: bash ./run_all.sh
 # The demo (step 7) needs Internet access to the XRPL testnet. Override with e.g.
-# CAPTURE_DEMO_FLAGS='-xrpl-rpc https://xrplcluster.com -xrpl-network 0' bash ./run_all.sh
+# XRPL_REGISTRY_SEED=<funded mainnet seed> XRPL_REGISTRY_SIGNER_SEEDS=<seed1,seed2> XRPL_SEED=<funded mainnet seed> CAPTURE_DEMO_FLAGS='-xrpl-rpc https://xrplcluster.com -xrpl-wss wss://xrplcluster.com -xrpl-network 0' bash ./run_all.sh
+# The T1 submitter needs Node.js (>= 18); dependencies are installed in step 7.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -42,7 +43,8 @@ echo '===== [6/8] Proof and public CA3 signature decoder fuzzing ====='
 go test ./capture -run '^$' -fuzz '^FuzzCaptureProofDecode$' -fuzztime=15s
 go test ./capture -run '^$' -fuzz '^FuzzManifestCASignatureDecode$' -fuzztime=8s
 
-echo '===== [7/8] Full capture demo (XRPL-anchored T0) and exact serialized sizes ====='
+echo '===== [7/8] Full capture demo (CA registry, T0, T1, revocation) and exact serialized sizes ====='
+npm --prefix tools/t1-submit ci --no-audit --no-fund
 # shellcheck disable=SC2086
 go run ./cmd/capture-demo ${CAPTURE_DEMO_FLAGS:-}
 
